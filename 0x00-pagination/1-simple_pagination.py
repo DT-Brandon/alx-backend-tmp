@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+"""server class to paginate a database
+"""
+
 import csv
 from typing import List
 from math import ceil
