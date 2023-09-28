@@ -1,113 +1,55 @@
-import express from 'express';
+import kue from 'kue';
 import redis from 'redis';
 import { promisify } from 'util';
-
-// utils =================================================
-
-const listProducts = [
-  {
-    itemId: 1,
-    itemName: 'Suitcase 250',
-    price: 50,
-    initialAvailableQuantity: 4,
-  },
-  {
-    itemId: 2,
-    itemName: 'Suitcase 450',
-    price: 100,
-    initialAvailableQuantity: 10,
-  },
-  {
-    itemId: 3,
-    itemName: 'Suitcase 650',
-    price: 350,
-    initialAvailableQuantity: 2,
-  },
-  {
-    itemId: 4,
-    itemName: 'Suitcase 1050',
-    price: 550,
-    initialAvailableQuantity: 5,
-  },
-];
-
-function getItemById(id) {
-  return listProducts.filter((item) => item.itemId === id)[0];
-}
-
-// redis ==========================================
+import express from 'express';
 
 const client = redis.createClient();
-const getAsync = promisify(client.get).bind(client);
-
-client.on('error', (error) => {
-  console.log(`Redis client not connected to the server: ${error.message}`);
-});
-
-client.on('connect', () => {
-  console.log('Redis client connected to the server');
-});
-
-function reserveStockById(itemId, stock) {
-  client.set(`item.${itemId}`, stock);
-}
-
-async function getCurrentReservedStockById(itemId) {
-  const stock = await getAsync(`item.${itemId}`);
-  return stock;
-}
-
-// express =============================================
-
+const queue = kue.createQueue();
 const app = express();
-const port = 1245;
+const PORT = 1245;
+const clientGet = promisify(client.get).bind(client);
+const clientSet = promisify(client.set).bind(client);
 
-const notFound = { status: 'Product not found' };
+const reserveSeat = async (number) =>  await clientSet('available_seats', number);
+const getCurrentAvailableSeats = async () => await clientGet('available_seats');
 
-app.listen(port, () => {
-  console.log(`app listening at http://localhost:${port}`);
+let reservationEnabled;
+
+
+app.get('/available_seats', async (req, res) => {
+  const numberOfAvailableSeats = await getCurrentAvailableSeats();
+  res.json({numberOfAvailableSeats});
 });
 
-app.get('/list_products', (req, res) => {
-  res.json(listProducts);
+app.get('/reserve_seat', async (req, res) => {
+  if (!reservationEnabled) res.json({ "status": "Reservation are blocked" });
+  let availableSeats = await getCurrentAvailableSeats();
+  const job = queue.create('reserve_seat', {availableSeats}).save((err) => {
+    if (!err) {
+      res.json({ status: 'Reservation in process' });
+    } else {
+      res.json({ status: 'Reservation failed' });
+    };
+  });
+  job.on('failed', (err) => console.log(`Seat reservation job ${job.id} failed: ${err}`));
+  job.on('complete', () => console.log(`Seat reservation job ${job.id} completed`));
 });
 
-app.get('/list_products/:itemId', async (req, res) => {
-  const itemId = Number(req.params.itemId);
-  const item = getItemById(itemId);
-
-  if (!item) {
-    res.json(notFound);
-    return;
-  }
-
-  const currentStock = await getCurrentReservedStockById(itemId);
-  const stock = currentStock !== null ? currentStock : item.initialAvailableQuantity;
-
-  item.currentQuantity = stock;
-  res.json(item);
+app.get('/process', async (req, res) => {
+  queue.process('reserve_seat', async (job, done) => {
+    console.log(job.data.availableSeats);
+    let availableSeats = await getCurrentAvailableSeats();
+    if (job.data.availableSeats <= 0) done(Error('Not enough seats available'));
+    const updatedAvailableSeats = Number(job.data.availableSeats) - 1
+    await reserveSeat(updatedAvailableSeats);
+    if (updatedAvailableSeats === 0) reservationEnabled = false;
+    done();
+  });
+  res.json({ status: 'Queue processing' });
 });
 
-app.get('/reserve_product/:itemId', async (req, res) => {
-  const itemId = Number(req.params.itemId);
-  const item = getItemById(itemId);
-  const noStock = { status: 'Not enough stock available', itemId };
-  const reservationConfirmed = { status: 'Reservation confirmed', itemId };
-
-  if (!item) {
-    res.json(notFound);
-    return;
-  }
-
-  let currentStock = await getCurrentReservedStockById(itemId);
-  if (currentStock === null) currentStock = item.initialAvailableQuantity;
-
-  if (currentStock <= 0) {
-    res.json(noStock);
-    return;
-  }
-
-  reserveStockById(itemId, Number(currentStock) - 1);
-
-  res.json(reservationConfirmed);
+app.listen(PORT, () => {
+  reserveSeat(50);
+  reservationEnabled = true;
+  console.log('Server is Running in port ' + PORT)
 });
